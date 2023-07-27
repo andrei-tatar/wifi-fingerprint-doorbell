@@ -23,7 +23,9 @@
 #define HREF_GPIO_NUM 26
 #define PCLK_GPIO_NUM 21
 
-Camera::Camera(/* args */) {}
+Camera::Camera() { _lock = xSemaphoreCreateMutex(); }
+
+Camera::~Camera() { vSemaphoreDelete(_lock); }
 
 esp_err_t Camera::begin() {
   camera_config_t config;
@@ -57,48 +59,57 @@ esp_err_t Camera::begin() {
   return esp_camera_init(&config);
 }
 
-static void *_malloc(size_t size) {
-  void *res = malloc(size);
-  if (res) {
-    return res;
-  }
-
-  // check if SPIRAM is enabled and is allocatable
-#if (CONFIG_SPIRAM_SUPPORT &&                                                  \
-     (CONFIG_SPIRAM_USE_CAPS_ALLOC || CONFIG_SPIRAM_USE_MALLOC))
-  return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-#endif
-  return NULL;
-}
-
-esp_err_t Camera::captureJpeg(uint8_t **out, size_t *out_len) {
+esp_err_t Camera::internalCaptureJpeg() {
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     return ESP_FAIL;
   }
 
   if (fb->format != PIXFORMAT_JPEG) {
-    bool jpeg_converted = frame2jpg(fb, 80, out, out_len);
+    bool jpeg_converted = frame2jpg(fb, 80, &_img, &_imgLen);
     esp_camera_fb_return(fb);
+    esp_camera_deinit();
     return jpeg_converted ? ESP_OK : ESP_FAIL;
   }
 
-  *out_len = fb->len;
-  *out = (uint8_t *)_malloc(fb->len);
-  if (!*out) {
+  _imgLen = fb->len;
+  _img =
+      (uint8_t *)heap_caps_malloc(fb->len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!*_img) {
     return ESP_FAIL;
   }
-  memcpy(*out, fb->buf, fb->len);
+  memcpy(_img, fb->buf, fb->len);
   esp_camera_fb_return(fb);
   return ESP_OK;
 }
 
+esp_err_t Camera::captureJpeg(uint8_t **out, size_t *out_len) {
+  esp_err_t ret = ESP_FAIL;
+  if (xSemaphoreTake(_lock, portMAX_DELAY)) {
+    if (_img) {
+      *out_len = _imgLen;
+      *out = (uint8_t *)heap_caps_malloc(_imgLen,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      memcpy(*out, _img, _imgLen);
+      ret = ESP_OK;
+    }
+
+    xSemaphoreGive(_lock);
+  }
+  return ret;
+}
+
 void Camera::loop() {
   uint32_t now = millis();
-  if (now > _nextCapture) {
-    _nextCapture = now + 500;
-
-    camera_fb_t *fb = esp_camera_fb_get();
-    esp_camera_fb_return(fb);
+  if (now + 500 > _lastCapture) {
+    if (xSemaphoreTake(_lock, portMAX_DELAY)) {
+      if (_img) {
+        free(_img);
+        _img = NULL;
+      }
+      internalCaptureJpeg();
+      _lastCapture = now;
+      xSemaphoreGive(_lock);
+    }
   }
 }
